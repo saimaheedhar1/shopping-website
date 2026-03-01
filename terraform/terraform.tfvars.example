@@ -1,0 +1,26 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# NEVER commit terraform.tfvars — it is gitignored.
+
+aws_region   = "us-east-1"
+project_name = "shop-demo"
+environment  = "prod"
+
+# Network
+vpc_cidr             = "10.0.0.0/16"
+availability_zones   = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.10.0/24", "10.0.20.0/24"]
+
+# ECS
+backend_cpu           = 512
+backend_memory        = 1024
+backend_desired_count = 2
+
+# Database
+db_name     = "shopdb"
+db_username = "shopuser"
+db_password = "CHANGE_ME_USE_A_SECURE_PASSWORD"
+
+# Optional: set these if you own a domain
+# domain_name         = "shop.example.com"
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."

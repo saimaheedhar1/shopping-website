@@ -1,0 +1,268 @@
+name: CD – Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: prod
+        type: choice
+        options: [prod, staging]
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel an in-progress deploy
+
+env:
+  AWS_REGION:       us-east-1
+  PROJECT_NAME:     shop-demo
+  TF_WORKING_DIR:   terraform
+
+jobs:
+  # ── 1. Run CI first ────────────────────────────────────────────────────────
+  ci:
+    name: Run CI checks
+    uses: ./.github/workflows/ci.yml
+
+  # ── 2. Terraform Apply ──────────────────────────────────────────────────────
+  terraform:
+    name: Terraform – Apply
+    runs-on: ubuntu-latest
+    needs: ci
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+    outputs:
+      ecr_url:        ${{ steps.tf-outputs.outputs.ecr_url }}
+      ecs_cluster:    ${{ steps.tf-outputs.outputs.ecs_cluster }}
+      ecs_service:    ${{ steps.tf-outputs.outputs.ecs_service }}
+      frontend_bucket: ${{ steps.tf-outputs.outputs.frontend_bucket }}
+      cloudfront_id:  ${{ steps.tf-outputs.outputs.cloudfront_id }}
+      cloudfront_url: ${{ steps.tf-outputs.outputs.cloudfront_url }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/shop-demo-cicd-deploy-role
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ github.event.inputs.environment || 'prod' }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var="environment=${{ github.event.inputs.environment || 'prod' }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform outputs
+        id: tf-outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "ecr_url=$(terraform output -raw ecr_backend_url)"         >> "$GITHUB_OUTPUT"
+          echo "ecs_cluster=$(terraform output -raw ecs_cluster_name)"    >> "$GITHUB_OUTPUT"
+          echo "ecs_service=$(terraform output -raw ecs_service_name)"    >> "$GITHUB_OUTPUT"
+          echo "frontend_bucket=$(terraform output -raw frontend_bucket)" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_id=$(terraform output -raw cloudfront_id 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
+          echo "cloudfront_url=$(terraform output -raw cloudfront_url)"   >> "$GITHUB_OUTPUT"
+
+  # ── 3. Build & Push Backend Docker Image ───────────────────────────────────
+  build-backend:
+    name: Build & Push Backend Image
+    runs-on: ubuntu-latest
+    needs: terraform
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.push.outputs.digest }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/shop-demo-cicd-deploy-role
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.terraform.outputs.ecr_url }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build & Push
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context:    app/backend
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          provenance: true
+          sbom:       true
+
+  # ── 4. Deploy Backend to ECS ────────────────────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend → ECS
+    runs-on: ubuntu-latest
+    needs: [terraform, build-backend]
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/shop-demo-cicd-deploy-role
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.PROJECT_NAME }}-backend \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update container image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition:  task-def.json
+          container-name:   backend
+          image:            ${{ needs.terraform.outputs.ecr_url }}:sha-${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:  ${{ steps.task-def.outputs.task-definition }}
+          service:          ${{ needs.terraform.outputs.ecs_service }}
+          cluster:          ${{ needs.terraform.outputs.ecs_cluster }}
+          wait-for-service-stability: true
+
+  # ── 5. Deploy Frontend to S3 + Invalidate CloudFront ──────────────────────
+  deploy-frontend:
+    name: Deploy Frontend → S3 + CloudFront
+    runs-on: ubuntu-latest
+    needs: [terraform, deploy-backend]
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/shop-demo-cicd-deploy-role
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Inject CloudFront API URL into frontend
+        run: |
+          sed -i "s|\${CLOUDFRONT_API_URL}|${{ needs.terraform.outputs.cloudfront_url }}|g" \
+            app/frontend/index.html
+
+      - name: Sync frontend to S3
+        run: |
+          aws s3 sync app/frontend/ s3://${{ needs.terraform.outputs.frontend_bucket }}/ \
+            --delete \
+            --cache-control "max-age=31536000,public,immutable" \
+            --exclude "*.html"
+
+          # HTML files: short cache so deploys propagate quickly
+          aws s3 sync app/frontend/ s3://${{ needs.terraform.outputs.frontend_bucket }}/ \
+            --delete \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --include "*.html" \
+            --exclude "*"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ needs.terraform.outputs.cloudfront_id }} \
+            --paths "/*"
+
+      - name: Print deployment URL
+        run: echo "🚀 Deployed → ${{ needs.terraform.outputs.cloudfront_url }}"
+
+  # ── 6. Smoke Test ───────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test – Production
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend, terraform]
+    if: success()
+
+    steps:
+      - name: Health check
+        run: |
+          URL="${{ needs.terraform.outputs.cloudfront_url }}"
+          echo "Testing $URL/api/health ..."
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/api/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS – waiting 15s..."
+            sleep 15
+          done
+          echo "❌ Health check failed after 5 attempts"
+          exit 1
+
+      - name: API smoke test
+        run: |
+          URL="${{ needs.terraform.outputs.cloudfront_url }}"
+          PRODUCTS=$(curl -sf "$URL/api/products" | jq '.total // empty')
+          if [ -z "$PRODUCTS" ]; then
+            echo "❌ Products API returned unexpected response"
+            exit 1
+          fi
+          echo "✅ Products API returned $PRODUCTS items"
